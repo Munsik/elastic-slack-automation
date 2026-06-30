@@ -1,0 +1,1 @@
+# elastic-slack-automation
