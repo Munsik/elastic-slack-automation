@@ -21,6 +21,7 @@
 - [POV → Production guide](#pov--production-guide)
 - [Verify against your stack version](#verify-against-your-stack-version)
 - [Troubleshooting](#troubleshooting)
+- [Learn more (official Elastic docs)](#learn-more-official-elastic-docs)
 - [Disclaimer](#disclaimer)
 
 ---
@@ -31,12 +32,17 @@ This bot is a thin **bridge between Slack and Elastic**. Three concepts are enou
 
 - **Elasticsearch** — an engine that stores and searches large volumes of data such as logs, metrics,
   traces, and security events. Your Observability, Security, and Search data lives here.
-- **Elastic Agent Builder** — lets you build an **AI Agent** on top of that data. When a user asks a
-  question in natural language, the Agent **reasons** on its own and **calls tools** (e.g. an ES|QL
-  search) to produce an answer. It can handle requests like "analyze the 5xx error trend over the last hour."
-- **Elastic Workflows** — **automation / orchestration** defined as YAML inside Kibana. It chains
-  **steps** to do things like "list the detection rules" or "if this condition holds, open a ticket."
-  Think of it as a lightweight playbook.
+- **[Elastic Agent Builder](https://www.elastic.co/elasticsearch/agent-builder)** (GA) — build **AI
+  Agents** on top of your Elasticsearch data. Given a natural-language question, an agent **reasons** on
+  its own and **calls tools** — built-in or custom, e.g. an **ES|QL** query — so answers are *grounded
+  in your data*. It can handle requests like "analyze the 5xx error trend over the last hour." Agents are
+  reachable from Kibana chat or programmatically, and can be exposed to external clients (Claude Desktop,
+  Cursor, LangChain, …) over the built-in **MCP** and **A2A** servers.
+- **[Elastic Workflows](https://www.elastic.co/elasticsearch/workflows)** (GA in 9.4) — the **native
+  automation engine** built into the Elastic platform. You declare automation as **YAML** (triggers →
+  steps → actions) that runs *right where your data lives* — no external automation tool or middleware.
+  Think of it as a versionable playbook. Agent Builder and Workflows **compose bidirectionally**: an
+  agent can trigger a workflow, and a workflow can call an agent (the `ai.agent` step).
 
 The catch is that these capabilities live **inside Kibana**, while teams actually work in Slack. Asking
 one question means opening Kibana and context-switching every time. **This bot removes that friction.**
@@ -332,17 +338,34 @@ This demo is a **local, proof-of-value setup**. Here's what to change for org-wi
 | Area | Now (POV) | Recommended (Production) | Why |
 |---|---|---|---|
 | **Slack connection** | Socket Mode (WebSocket) | **HTTP (Events API + Request URL)** | WebSocket is stateful and hard to scale horizontally. HTTP scales statelessly when you use a public endpoint + signature verification + **an async worker after the 3s ACK**. |
-| **State** | in-memory `THREAD_CONV` dict | **External store such as Redis** | The thread↔conversation mapping must survive restarts and span multiple instances so multi-turn doesn't break. |
+| **State** | in-memory `THREAD_CONV` dict | **a persistent store — e.g. a small Elasticsearch index (reuse the existing connection) or Redis** | Only the **Slack thread_ts ↔ conversation_id mapping** must survive restarts / span instances so multi-turn doesn't break. (The conversation *content* is already durable in Elasticsearch — see note below.) |
 | **Auth / authorization** | one shared API Key | **per-user Elastic identity mapping** (Slack user → per-user API Key) | An Agent's tools run as the "current user," so per-user keys enable **RBAC and Space isolation**. A shared key gives everyone the same privileges. |
-| **Cost / quota** | none | **token-usage tracking + app-level quotas** | Monitor Agent Builder consumption and enforce per-user/channel rate limits and budgets in the app. |
+| **Cost / quota** | none | **token-usage tracking + app-level quotas** | Agent Builder exposes per-conversation **token usage** (consumption API) — monitor it and enforce per-user/channel rate limits in the app. Note Workflows billing: execution-based on Elastic Cloud Serverless (from May 1, 2026); Hosted/self-managed are in a promotional period (not yet charged). |
 | **Deployment** | laptop / single process | **stateless replicas behind an LB**, containerized, **Enterprise Grid org-level install** | Availability and scalability; the bot shouldn't be tied to one machine. |
 | **Secrets** | `.env` file | **Secrets Manager / Vault** | Inject tokens/API keys from a secret store rather than code/disk. |
 | **Reliability** | simple polling / swallowed errors | **retries · timeouts · idempotency · DLQ** | Tolerate Slack event re-deliveries, Task Manager latency, and network errors. |
 | **Observability** | console logs (`DEBUG_*`) | **instrument the bot with Elastic APM / EDOT** | Send the bot's latency/errors/traces to Elastic (dogfooding) for operational visibility. |
 
+> **A note on state — isn't Elasticsearch already doing this?** Partly, yes. There are two different
+> kinds of state:
+> 1. **Conversation content (chat history)** — already persisted in Elasticsearch by Agent Builder and
+>    retrievable via `GET /api/agent_builder/conversations/{id}`. Durability here is solved; the bot
+>    doesn't need to store it.
+> 2. **The Slack `thread_ts` ↔ `conversation_id` mapping** — the *only* thing the bot keeps in memory.
+>    Elastic doesn't store this glue (it doesn't know which Slack thread a conversation belongs to). If
+>    the bot restarts, the mapping is lost and follow-ups in an existing thread can't find which
+>    conversation to continue — even though the conversation itself is safe in Elastic.
+>
+> Since the bot already talks to Elastic, the most natural home for that mapping is a **small
+> Elasticsearch index** (e.g. `slack-thread-map`, docs `{thread_ts, conversation_id}`) — no extra
+> infrastructure. Redis is just an alternative when you want sub-millisecond lookups or TTL eviction.
+> You can also avoid an external store entirely by attaching the `conversation_id` to the thread's bot
+> message via **Slack message metadata** and reading it back.
+
 ### Transition checklist
 - [ ] Switch Socket Mode → HTTP; move work to an **async queue/worker** after the 3s ACK
-- [ ] Externalize `THREAD_CONV` to Redis (or equivalent) with a TTL
+- [ ] Persist the `thread_ts → conversation_id` mapping (a small **Elasticsearch index** reuses the
+      existing connection; Redis with TTL is an alternative)
 - [ ] Map Slack users ↔ Elastic identity/Space; strategy for issuing/rotating **per-user API Keys**
 - [ ] Token-usage/cost monitoring + per-user/channel rate limits
 - [ ] Containerize + stateless replicas behind an LB, with health checks
@@ -357,9 +380,11 @@ This demo is a **local, proof-of-value setup**. Here's what to change for org-wi
 
 ## Verify against your stack version
 
-Agent Builder and Workflows are **Tech Preview**, so paths/responses may change across 9.x. The code
-parses responses defensively, but verify the following on your stack (check with `GET kbn:/api/...` in
-Dev Tools).
+**Agent Builder is GA (since 9.3) and Workflows is GA (9.4, enabled by default).** That said, this demo
+calls several APIs whose exact paths and response shapes can still vary by minor version — and a few
+(e.g. the async converse stream and execution logs) aren't all in the public API reference yet. So
+verify the following on your stack (check with `GET kbn:/api/...` in Dev Tools). The client already
+parses responses defensively.
 
 | Purpose | Path used by the code | Confidence | Notes |
 |---|---|---|---|
@@ -394,9 +419,22 @@ Dev Tools).
 
 ---
 
+## Learn more (official Elastic docs)
+
+- **Elastic Agent Builder** — overview & get started: <https://www.elastic.co/docs/explore-analyze/ai-features/elastic-agent-builder>
+- **Elastic Workflows** — overview: <https://www.elastic.co/docs/explore-analyze/workflows>
+- **What's new in Elastic 9.4** (Workflows GA, Agent Builder updates): <https://www.elastic.co/blog/whats-new-elastic-9-4-0>
+- Product pages: [Agent Builder](https://www.elastic.co/elasticsearch/agent-builder) · [Workflows](https://www.elastic.co/elasticsearch/workflows)
+- Background: [Agent Builder & context engineering](https://www.elastic.co/search-labs/blog/elastic-ai-agent-builder-context-engineering-introduction) · [Building automation with Workflows](https://www.elastic.co/search-labs/blog/elastic-workflows-automation)
+
+---
+
 ## Disclaimer
 
-This is a demo/POV example. Elastic's Agent Builder and Workflows are **Tech Preview** at the time of
-writing, and API paths/response shapes may change. Review the
-[transition guide](#pov--production-guide) before any production use. This repository is not an official
-Elastic product.
+A demo / POV example built by an Elastic Solutions Architect to showcase **Elastic Agent Builder** and
+**Elastic Workflows** in a ChatOps setting. Both features are GA (Agent Builder since 9.3, Workflows in
+9.4), but this bot uses some APIs that are version-specific or not yet in the public reference, so paths
+and response shapes may differ on your stack — review the
+[verification table](#verify-against-your-stack-version) and the
+[transition guide](#pov--production-guide) before production use. This repository is a community sample,
+not an official Elastic product.
